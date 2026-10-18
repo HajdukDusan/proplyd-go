@@ -113,11 +113,6 @@ Errors: `ErrCacheUnavailable`, `ErrBackendUnavailable`, `ErrBackpressure`,
 cache hits, loads, fallbacks, invalidations and resets; `cli.State()`
 reports the breaker state.
 
-## Playground
-
-An interactive local deployment with a live dashboard lives in the separate
-`proplyd-playground` module (next to this repo).
-
 ## Tests
 
 ```
