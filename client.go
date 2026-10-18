@@ -240,7 +240,10 @@ func isCacheFailure(err error) bool {
 	switch st.Code() {
 	case codes.Unavailable:
 		return protocol.Reason(err) != protocol.ReasonBackendUnavailable
-	case codes.DeadlineExceeded, codes.Internal, codes.Unknown, codes.ResourceExhausted,
+	case codes.ResourceExhausted:
+		// Write-behind backpressure is the cache working as designed.
+		return protocol.Reason(err) != protocol.ReasonBackpressure
+	case codes.DeadlineExceeded, codes.Internal, codes.Unknown,
 		codes.Aborted, codes.DataLoss, codes.Unimplemented:
 		return true
 	}

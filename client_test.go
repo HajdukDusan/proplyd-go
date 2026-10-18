@@ -9,6 +9,7 @@ import (
 
 	proplyd "github.com/c12s/proplyd-go"
 	"github.com/c12s/proplyd-go/internal/testcluster"
+	"github.com/c12s/proplyd/pkg/server"
 	"github.com/c12s/proplyd/proplydtest"
 )
 
@@ -67,7 +68,7 @@ func mustSet(t *testing.T, ns *proplyd.Namespace, key, value string) {
 func TestStrategies(t *testing.T) {
 	c := testcluster.New(t, testcluster.Options{})
 	for _, read := range []proplyd.ReadStrategy{proplyd.ReadThrough, proplyd.CacheAside, proplyd.RefreshAhead} {
-		for _, write := range []proplyd.WriteStrategy{proplyd.WriteThrough, proplyd.WriteAround} {
+		for _, write := range []proplyd.WriteStrategy{proplyd.WriteThrough, proplyd.WriteAround, proplyd.WriteBehind} {
 			name := fmt.Sprintf("%s.%s", read, write)
 			t.Run(name, func(t *testing.T) {
 				spec := proplyd.Spec{Read: read, Write: write, TTL: time.Minute}
@@ -463,4 +464,66 @@ func TestInvalidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	eventually(t, func() error { return valueIs(b, "k", "v2") })
+}
+
+func TestWriteBehindReachesTheStore(t *testing.T) {
+	c := testcluster.New(t, testcluster.Options{Server: server.Options{FlushInterval: 300 * time.Millisecond}})
+	a := c.Edge().Namespace(t, "wb", proplyd.Spec{Write: proplyd.WriteBehind}, testcluster.NearConfig())
+	b := c.Edge().Namespace(t, "wb", proplyd.Spec{Write: proplyd.WriteBehind}, testcluster.NearConfig())
+	testcluster.WaitNearUsable(t, b)
+	mustSet(t, a, "k", "v")
+	if it := mustGet(t, a, "k"); !it.Pending || string(it.Value) != "v" {
+		t.Fatalf("own write: %+v", it)
+	}
+	eventually(t, func() error { return valueIs(b, "k", "v") })
+	eventually(t, func() error {
+		it, err := c.Store.Get(context.Background(), "/wb/k")
+		if err != nil || string(it.Value) != "v" {
+			return fmt.Errorf("store has %q (%v)", it.Value, err)
+		}
+		return nil
+	})
+	eventually(t, func() error {
+		if it := mustGet(t, b, "k"); it.Pending {
+			return errors.New("still pending after the flush")
+		}
+		return nil
+	})
+}
+
+func TestWriteBehindRejectsWhenPartitioned(t *testing.T) {
+	c := testcluster.New(t, testcluster.Options{})
+	e := c.Edge()
+	ns := e.Namespace(t, "wb", proplyd.Spec{Write: proplyd.WriteBehind}, testcluster.NearConfig())
+	mustSet(t, ns, "k", "v1")
+	e.Link.SetMode(proplydtest.Refuse)
+	if err := ns.Set(ctxT(t), "k", []byte("v2")); !errors.Is(err, proplyd.ErrCacheUnavailable) {
+		t.Fatalf("write-behind while partitioned: %v", err)
+	}
+	e.Link.SetMode(proplydtest.Forward)
+}
+
+func TestWriteBehindBackpressureIsNotACacheFailure(t *testing.T) {
+	c := testcluster.New(t, testcluster.Options{Server: server.Options{MaxPending: 2}})
+	e := c.Edge()
+	ns := e.Namespace(t, "wb", proplyd.Spec{Write: proplyd.WriteBehind}, proplyd.NearCacheConfig{Disabled: true})
+	mustGet(t, ns, "warm")
+	c.ServerBackend.SetDown(true) // nothing gets flushed
+	mustSet(t, ns, "a", "1")
+	mustSet(t, ns, "b", "1")
+	for range 10 {
+		if err := ns.Set(ctxT(t), "c", []byte("1")); !errors.Is(err, proplyd.ErrBackpressure) {
+			t.Fatalf("third pending key: %v", err)
+		}
+	}
+	if st := e.Client.State(); st != proplyd.BreakerClosed {
+		t.Fatalf("breaker %v: backpressure must not count as a cache failure", st)
+	}
+	c.ServerBackend.SetDown(false)
+	eventually(t, func() error {
+		if err := ns.Set(context.Background(), "c", []byte("1")); err != nil {
+			return err
+		}
+		return nil
+	})
 }

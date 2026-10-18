@@ -29,7 +29,8 @@ type nsSpec struct {
 	policy proplyd.Policy
 }
 
-// allSpecs covers every read x write strategy, each with a different
+// allSpecs covers read-through, cache-aside and refresh-ahead with
+// write-through and write-around, and write-behind with the first two, each with a different
 // near-cache policy. All follow the store's changes (SyncWatch), which is
 // what makes convergence after faults a valid expectation.
 func allSpecs() []nsSpec {
@@ -43,6 +44,8 @@ func allSpecs() []nsSpec {
 		{"ca-wa", proplyd.Spec{Read: proplyd.CacheAside, Write: proplyd.WriteAround}, proplyd.TwoQueue},
 		{"ra-wt", ra(proplyd.WriteThrough), proplyd.FIFO},
 		{"ra-wa", ra(proplyd.WriteAround), proplyd.WTinyLFU},
+		{"rt-wb", proplyd.Spec{Read: proplyd.ReadThrough, Write: proplyd.WriteBehind}, proplyd.SIEVE},
+		{"ca-wb", proplyd.Spec{Read: proplyd.CacheAside, Write: proplyd.WriteBehind}, proplyd.LRU},
 	}
 }
 
@@ -52,6 +55,9 @@ func allSpecs() []nsSpec {
 type keyState struct {
 	ns, key string
 	owner   int
+	// lossy: acknowledged writes may be lost (write-behind under faults
+	// that wipe Redis), so any write ever issued is an allowed state.
+	lossy bool
 
 	mu      sync.Mutex
 	deletes []bool       // deletes[c-1]: write c was a delete
@@ -78,6 +84,9 @@ func (k *keyState) stateOf(c int) readState {
 func (k *keyState) allowed(s readState) bool {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	if k.lossy {
+		return !s.found || (s.counter >= 1 && s.counter <= len(k.deletes) && !k.deletes[s.counter-1])
+	}
 	if k.stateOf(k.acked) == s {
 		return true
 	}
@@ -135,6 +144,9 @@ type workloadConfig struct {
 	// Such writes count as maybe-applied.
 	allowWriteErr func(spec proplyd.Spec, err error) bool
 	near          func(edge int) proplyd.NearCacheConfig
+	// lossyWriteBehind: write-behind keys may lose acknowledged writes
+	// (the test wipes Redis).
+	lossyWriteBehind bool
 	// edgeConfig adjusts an edge's client configuration.
 	edgeConfig func(edge int, cfg *proplyd.Config)
 	// nodes, if set, are the proplyd replicas edges connect to (round
@@ -185,7 +197,8 @@ func newWorkload(t *testing.T, c *testcluster.Cluster, cfg workloadConfig, specs
 	for _, s := range specs {
 		var ks []*keyState
 		for j := range cfg.keys {
-			ks = append(ks, &keyState{ns: s.name, key: fmt.Sprint("key-", j), owner: j % cfg.edges, unacked: map[int]bool{}})
+			ks = append(ks, &keyState{ns: s.name, key: fmt.Sprint("key-", j), owner: j % cfg.edges, unacked: map[int]bool{},
+				lossy: cfg.lossyWriteBehind && s.spec.Write == proplyd.WriteBehind})
 		}
 		w.keys = append(w.keys, ks)
 	}
@@ -237,7 +250,7 @@ func (w *workload) drive(ctx context.Context, edge int) {
 			continue
 		}
 		k := w.keys[si][r.IntN(len(w.keys[si]))]
-		w.read(ns, k, edge, lastRev)
+		w.read(ns, w.specs[si].spec, k, edge, lastRev)
 	}
 }
 
@@ -269,10 +282,14 @@ func (w *workload) write(ns *proplyd.Namespace, spec proplyd.Spec, k *keyState, 
 	}
 }
 
-func (w *workload) read(ns *proplyd.Namespace, k *keyState, edge int, lastRev map[*keyState]int64) {
+func (w *workload) read(ns *proplyd.Namespace, spec proplyd.Spec, k *keyState, edge int, lastRev map[*keyState]int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	// Each edge's namespaces are used by one goroutine, so the counter
+	// tells whether this read fell back to the store.
+	fallbacks := ns.Stats().FallbackReads
 	it, err := ns.Lookup(ctx, k.key)
+	fellBack := ns.Stats().FallbackReads > fallbacks
 	w.reads.Add(1)
 	if err != nil {
 		w.fail("read %s/%s by edge %d: %v", k.ns, k.key, edge, err)
@@ -287,7 +304,9 @@ func (w *workload) read(ns *proplyd.Namespace, k *keyState, edge int, lastRev ma
 		}
 		s.counter = counter
 	}
-	if edge == k.owner && !k.allowed(s) {
+	// A fallback read comes from the store and cannot see write-behind
+	// writes still pending in the cache (documented trade-off).
+	if edge == k.owner && !(spec.Write == proplyd.WriteBehind && fellBack) && !k.allowed(s) {
 		w.fail("read-your-writes violated: %s read %+v from %v (rev %d)", k.describe(), s, it.Source, it.Revision)
 	}
 	if w.cfg.monotonic {
@@ -318,6 +337,7 @@ func (w *workload) storeState(k *keyState) (readState, int64) {
 // verify runs every end-of-run check.
 func (w *workload) verify() {
 	w.t.Helper()
+	w.waitFlushed(60 * time.Second)
 	w.report()
 	if n := w.unexpected.Load(); n > 0 {
 		w.t.Errorf("%d unexpected errors or violations, first ones:\n  %s", n, strings.Join(w.errs, "\n  "))
@@ -325,6 +345,31 @@ func (w *workload) verify() {
 	w.verifyStore()
 	w.verifyConvergence(30 * time.Second)
 	w.verifyRedis()
+}
+
+// waitFlushed waits until no write-behind write is pending, so that the
+// store checks below see every acknowledged write.
+func (w *workload) waitFlushed(timeout time.Duration) {
+	w.t.Helper()
+	rc := w.c.Redis.Client()
+	defer rc.Close()
+	deadline := time.Now().Add(timeout)
+	for _, s := range w.specs {
+		if s.spec.Write != proplyd.WriteBehind {
+			continue
+		}
+		for {
+			n, err := rc.ZCard(context.Background(), "pd:{"+s.name+"}:q").Result()
+			if err == nil && n == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				w.t.Errorf("%s: %d writes still pending after %v (%v)", s.name, n, timeout, err)
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 }
 
 // verifyStore: no acknowledged write was lost.
@@ -468,11 +513,17 @@ func (w *workload) report() {
 	}
 }
 
-// writeThroughMayFail allows the errors write-through writes are specified
-// to return while the cache, or its link to the store, is unavailable.
+// writeThroughMayFail allows the errors write-through and write-behind
+// writes are specified to return while the cache, or its link to the store,
+// is unavailable.
 func writeThroughMayFail(spec proplyd.Spec, err error) bool {
-	return spec.Write == proplyd.WriteThrough &&
-		(errors.Is(err, proplyd.ErrCacheUnavailable) || errors.Is(err, proplyd.ErrBackendUnavailable))
+	switch spec.Write {
+	case proplyd.WriteThrough:
+		return errors.Is(err, proplyd.ErrCacheUnavailable) || errors.Is(err, proplyd.ErrBackendUnavailable)
+	case proplyd.WriteBehind:
+		return errors.Is(err, proplyd.ErrCacheUnavailable) || errors.Is(err, proplyd.ErrBackpressure)
+	}
+	return false
 }
 
 func envDuration(t *testing.T, key string, def, short time.Duration) time.Duration {

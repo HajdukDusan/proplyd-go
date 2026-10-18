@@ -23,6 +23,9 @@ var (
 	ErrPrefixNotAllowed = errors.New("proplyd: key prefix not allowed")
 	// ErrInvalidArgument: bad key, value or configuration.
 	ErrInvalidArgument = errors.New("proplyd: invalid argument")
+	// ErrBackpressure: too many write-behind writes are waiting to be
+	// flushed; retry later.
+	ErrBackpressure = errors.New("proplyd: too many pending write-behind writes")
 	// ErrClosed: the client or namespace was closed.
 	ErrClosed = errors.New("proplyd: closed")
 )
@@ -45,6 +48,8 @@ func mapErr(err error) error {
 		return fmt.Errorf("%w: %s", ErrInvalidArgument, status.Convert(err).Message())
 	case protocol.ReasonBackendUnavailable:
 		return fmt.Errorf("%w: %w", ErrBackendUnavailable, err)
+	case protocol.ReasonBackpressure:
+		return fmt.Errorf("%w: %s", ErrBackpressure, status.Convert(err).Message())
 	case protocol.ReasonNamespaceNotFound:
 		// Lost again right after re-registering (Redis flapping).
 		return fmt.Errorf("%w: %w", ErrCacheUnavailable, err)

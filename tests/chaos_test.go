@@ -135,6 +135,8 @@ func TestChaos(t *testing.T) {
 		duration:      envDuration(t, "PROPLYD_CHAOS_DURATION", 15*time.Second, 5*time.Second),
 		writeRatio:    0.3,
 		allowWriteErr: writeThroughMayFail,
+		// "redis crash (data lost)" also loses pending write-behind writes.
+		lossyWriteBehind: true,
 	}, allSpecs())
 
 	ctx, cancel := context.WithCancel(context.Background())

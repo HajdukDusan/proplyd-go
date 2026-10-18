@@ -33,9 +33,21 @@ is tagged.
   NAMESPACE_NOT_FOUND triggers one re-register and retry; if it repeats,
   that counts as cache unavailable.
 
+- **Write-behind**:
+  - success: `near.invalidate(key, 0)`, and no `recentWrites` (there is no
+    store revision yet);
+  - unreachable cache: rejected;
+  - BACKPRESSURE (ResourceExhausted): neutral for the breaker, mapped to
+    `ErrBackpressure`.
+
 ## System tests (`tests/`)
 
-Single-writer-per-key workload. Allowed read states for an owner: the last
+Single-writer-per-key workload. It covers the namespaces rt-wb and ca-wb
+too.
+- `verify` waits for every write-behind queue to drain first.
+- Owner read-your-writes is not checked on write-behind reads that fell
+  back to the store.
+- Chaos sets `lossyWriteBehind`, because a Redis wipe loses pending writes. Allowed read states for an owner: the last
 acked write, or any failed (maybe applied, maybe late) write. Monotonic
 reads are checked only in TestStress (no faults). `verifyConvergence`
 requires breakers closed, near-caches usable and *no fallback reads* during

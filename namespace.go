@@ -28,6 +28,7 @@ const (
 	RefreshAhead = protocol.RefreshAhead
 	WriteThrough = protocol.WriteThrough
 	WriteAround  = protocol.WriteAround
+	WriteBehind  = protocol.WriteBehind
 	SyncWatch    = protocol.SyncWatch
 	SyncNone     = protocol.SyncNone
 )
@@ -81,6 +82,10 @@ type Item struct {
 	// at which the key was seen missing).
 	Revision int64
 	Source   Source
+	// Pending: a write-behind write that the cache has not flushed to the
+	// store yet. Revision is then the newest store revision the cache knew
+	// for the key when it was written.
+	Pending bool
 }
 
 // Namespace is a handle on a cache namespace. It is safe for concurrent
@@ -304,7 +309,7 @@ func (n *Namespace) Lookup(ctx context.Context, key string) (Item, error) {
 	case err == nil && resp.GetMiss():
 		return n.loadAside(ctx, key, start)
 	case err == nil:
-		it := Item{Found: resp.GetFound(), Value: resp.GetValue(), Revision: resp.GetRevision(), Source: SourceCache}
+		it := Item{Found: resp.GetFound(), Value: resp.GetValue(), Revision: resp.GetRevision(), Source: SourceCache, Pending: resp.GetPending()}
 		if resp.GetSource() == api.Source_SOURCE_BACKEND {
 			it.Source = SourceBackend
 			n.stats.CacheLoads.Add(1)
@@ -385,6 +390,12 @@ func (n *Namespace) installNear(key string, start uint64, it Item) {
 
 // Set writes key.
 //
+// With write-behind, the cache acknowledges once the write is pending in
+// Redis and writes the store later; when the cache is unreachable the
+// write fails with ErrCacheUnavailable, and when too many writes are
+// pending with ErrBackpressure. While the cache is unreachable, fallback
+// reads come from the store and miss writes still pending in the cache.
+//
 // With write-through, the cache writes the backing store and caches the
 // value; when the cache is unreachable the write fails with
 // ErrCacheUnavailable (it may still have been applied if the cache failed
@@ -423,8 +434,16 @@ func (n *Namespace) write(ctx context.Context, key string, del bool, value []byt
 		return err
 	})
 	if err == nil {
-		n.writes.add(key, rev)
 		n.stats.Writes.Add(1)
+		if n.spec.Write == WriteBehind {
+			// Not in the store yet, so there is no revision to remember;
+			// reads go to the cache, which serves the pending write.
+			if n.near != nil {
+				n.near.invalidate(key, 0)
+			}
+			return nil
+		}
+		n.writes.add(key, rev)
 		if n.near != nil {
 			if n.spec.Write == WriteThrough {
 				n.near.install(key, start, Item{Found: !del, Value: value, Revision: rev})

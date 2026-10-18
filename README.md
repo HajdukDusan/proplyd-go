@@ -18,8 +18,12 @@ app ─▶ near-cache (in process) ─▶ proplyd (gRPC → Redis) ─▶ etcd
   and go through a circuit breaker. Only failures of the cache itself count
   against it.
 - **Fallbacks.** When the cache is down, slow or partitioned away, reads go
-  to the store directly, and so do write-around writes. Write-through writes
-  fail with `ErrCacheUnavailable`.
+  to the store directly, and so do write-around writes. Write-through and
+  write-behind writes fail with `ErrCacheUnavailable`.
+- **Write-behind.** A write returns once it is pending in the cache, and
+  proplyd writes the store later. Reads show such values with
+  `Item.Pending`. When too many writes wait, writes fail with
+  `ErrBackpressure`, which does not count against the breaker.
 - **Read-your-writes.** This holds even across fallbacks and restarts: the
   client remembers the revisions of its recent writes and never serves
   anything older.
@@ -98,8 +102,12 @@ transparently.
   missed. If that is impossible, the near-cache is reset.
 - **Ambiguous writes.** A write that fails with a timeout or
   `ErrCacheUnavailable` may or may not have been applied.
+- **Write-behind caveats.** A write-behind write can be dropped later if
+  the store changed behind it (the store wins), or lost if Redis loses its
+  data. While the cache is unreachable, fallback reads miss pending
+  writes.
 
-Errors: `ErrCacheUnavailable`, `ErrBackendUnavailable`,
+Errors: `ErrCacheUnavailable`, `ErrBackendUnavailable`, `ErrBackpressure`,
 `ErrNamespaceConflict`, `ErrPrefixNotAllowed`, `ErrInvalidArgument`,
 `ErrClosed`, plus the caller's context errors. `ns.Stats()` reports near and
 cache hits, loads, fallbacks, invalidations and resets; `cli.State()`
