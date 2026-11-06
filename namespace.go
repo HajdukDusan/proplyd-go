@@ -84,7 +84,9 @@ type Item struct {
 	Source   Source
 	// Pending: a write-behind write that the cache has not flushed to the
 	// store yet. Revision is then the newest store revision the cache knew
-	// for the key when it was written.
+	// for the key when it was written; it can sort before a revision read
+	// from the store directly while an earlier write was being flushed, so
+	// do not order pending values against store reads by revision.
 	Pending bool
 }
 

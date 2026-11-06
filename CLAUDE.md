@@ -49,7 +49,8 @@ too.
   back to the store.
 - Chaos sets `lossyWriteBehind`, because a Redis wipe loses pending writes. Allowed read states for an owner: the last
 acked write, or any failed (maybe applied, maybe late) write. Monotonic
-reads are checked only in TestStress (no faults). `verifyConvergence`
+reads are checked only in TestStress (no faults), and only for non-pending
+values (a pending revision is not a store revision). `verifyConvergence`
 requires breakers closed, near-caches usable and *no fallback reads* during
 the round; otherwise a stuck cache hides behind fallbacks (this masked a
 real problem once). `verifyRedis` decodes proplyd's Redis entries directly

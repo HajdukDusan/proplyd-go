@@ -309,7 +309,12 @@ func (w *workload) read(ns *proplyd.Namespace, spec proplyd.Spec, k *keyState, e
 	if edge == k.owner && !(spec.Write == proplyd.WriteBehind && fellBack) && !k.allowed(s) {
 		w.fail("read-your-writes violated: %s read %+v from %v (rev %d)", k.describe(), s, it.Source, it.Revision)
 	}
-	if w.cfg.monotonic {
+	// A pending write-behind value has no store revision yet; it carries the
+	// newest one the cache knew when it was written, which can sort before a
+	// revision a cache-aside reader read from the store directly while an
+	// earlier write was being flushed. Revisions are compared for stored
+	// data only.
+	if w.cfg.monotonic && !it.Pending {
 		if it.Revision < lastRev[k] {
 			w.fail("non-monotonic read of %s/%s by edge %d: rev %d after %d (%v)", k.ns, k.key, edge, it.Revision, lastRev[k], it.Source)
 		}
