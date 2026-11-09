@@ -100,6 +100,7 @@ type Namespace struct {
 	near   *nearCache      // nil when disabled
 	ncfg   NearCacheConfig
 	writes *recentWrites
+	loads  coalescer // direct reads (cache-aside loads and fallbacks)
 
 	registered atomic.Bool
 	regMu      sync.Mutex
@@ -280,15 +281,25 @@ func (n *Namespace) Get(ctx context.Context, key string) ([]byte, bool, error) {
 // Lookup reads key: from the near-cache if it holds a usable copy, else
 // from the cache, else (cache unreachable) from the backing store.
 func (n *Namespace) Lookup(ctx context.Context, key string) (Item, error) {
-	if err := n.check(ctx, key); err != nil {
-		return Item{}, err
+	begin := time.Now()
+	it, path, err := n.lookup(ctx, key)
+	if err == nil {
+		n.stats.observeRead(path, time.Since(begin))
 	}
+	return it, err
+}
+
+func (n *Namespace) lookup(ctx context.Context, key string) (Item, readPath, error) {
+	if err := n.check(ctx, key); err != nil {
+		return Item{}, 0, err
+	}
+	ticket := n.loads.ticket()
 	minRev := n.writes.get(key)
 	if n.near != nil {
 		if n.nearUsable() {
 			if it, ok := n.near.get(key); ok && it.Revision >= minRev {
 				n.stats.NearHits.Add(1)
-				return it, nil
+				return it, readNear, nil
 			}
 		}
 		n.stats.NearMisses.Add(1)
@@ -305,27 +316,44 @@ func (n *Namespace) Lookup(ctx context.Context, key string) (Item, error) {
 		return err
 	})
 	if err != nil && ctx.Err() != nil {
-		return Item{}, ctx.Err()
+		return Item{}, 0, ctx.Err()
 	}
 	switch {
 	case err == nil && resp.GetMiss():
-		return n.loadAside(ctx, key, start)
+		it, err := n.loadAside(ctx, key, start, ticket)
+		return it, readAside, err
 	case err == nil:
 		it := Item{Found: resp.GetFound(), Value: resp.GetValue(), Revision: resp.GetRevision(), Source: SourceCache, Pending: resp.GetPending()}
+		path := readCache
 		if resp.GetSource() == api.Source_SOURCE_BACKEND {
 			it.Source = SourceBackend
+			path = readLoad
 			n.stats.CacheLoads.Add(1)
 		} else {
 			n.stats.CacheHits.Add(1)
 		}
 		n.installNear(key, start, it)
-		return it, nil
+		n.loads.observe(key)
+		return it, path, nil
 	case canFallback(err):
 		// The cache is down, or it cannot reach the backing store (but this
 		// client may).
-		return n.fallbackRead(ctx, key, err)
+		it, err := n.fallbackRead(ctx, key, ticket, err)
+		return it, readFallback, err
 	}
-	return Item{}, mapErr(err)
+	return Item{}, 0, mapErr(err)
+}
+
+// directGet reads key from the backing store, sharing a concurrent read of
+// it (see coalescer). leader reports whether this call made the read.
+func (n *Namespace) directGet(ctx context.Context, key string, ticket uint64) (backend.Item, bool, error) {
+	item, leader, err := n.loads.do(ctx, key, ticket, n.c.cfg.WriteTimeout, func(ctx context.Context) (backend.Item, error) {
+		return n.direct.Get(ctx, key)
+	})
+	if !leader && err == nil {
+		n.stats.SharedLoads.Add(1)
+	}
+	return item, leader, err
 }
 
 // canFallback reports whether a failed cache call may be served from the
@@ -336,15 +364,19 @@ func canFallback(err error) bool {
 }
 
 // loadAside handles a cache-aside miss: load from the backing store, fill
-// the cache in the background.
-func (n *Namespace) loadAside(ctx context.Context, key string, start uint64) (Item, error) {
-	item, err := n.direct.Get(ctx, key)
+// the cache in the background. Of concurrent misses sharing one load, only
+// the one that made it fills the cache.
+func (n *Namespace) loadAside(ctx context.Context, key string, start, ticket uint64) (Item, error) {
+	item, leader, err := n.directGet(ctx, key, ticket)
 	if err != nil {
 		return Item{}, fmt.Errorf("%w: %w", ErrBackendUnavailable, err)
 	}
 	n.stats.AsideLoads.Add(1)
 	it := itemFromBackend(item)
 	n.installNear(key, start, it)
+	if !leader {
+		return it, nil
+	}
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
@@ -368,11 +400,11 @@ func itemFromBackend(item backend.Item) Item {
 	return it
 }
 
-func (n *Namespace) fallbackRead(ctx context.Context, key string, cause error) (Item, error) {
+func (n *Namespace) fallbackRead(ctx context.Context, key string, ticket uint64, cause error) (Item, error) {
 	if n.direct == nil {
 		return Item{}, mapErr(cause)
 	}
-	item, err := n.direct.Get(ctx, key)
+	item, _, err := n.directGet(ctx, key, ticket)
 	if err != nil {
 		return Item{}, errors.Join(fmt.Errorf("%w: %w", ErrBackendUnavailable, err), mapErr(cause))
 	}
@@ -420,6 +452,19 @@ func (n *Namespace) Delete(ctx context.Context, key string) error {
 }
 
 func (n *Namespace) write(ctx context.Context, key string, del bool, value []byte) error {
+	begin := time.Now()
+	fallback, err := n.doWrite(ctx, key, del, value)
+	// Even a failed write may have been applied; reads in flight may
+	// predate it.
+	n.loads.observe(key)
+	if err == nil {
+		n.stats.observeWrite(fallback, time.Since(begin))
+	}
+	return err
+}
+
+// doWrite writes key; fallback reports a write made to the store directly.
+func (n *Namespace) doWrite(ctx context.Context, key string, del bool, value []byte) (fallback bool, _ error) {
 	var start uint64
 	if n.near != nil {
 		start = n.near.begin()
@@ -443,7 +488,7 @@ func (n *Namespace) write(ctx context.Context, key string, del bool, value []byt
 			if n.near != nil {
 				n.near.invalidate(key, 0)
 			}
-			return nil
+			return false, nil
 		}
 		n.writes.add(key, rev)
 		if n.near != nil {
@@ -453,7 +498,7 @@ func (n *Namespace) write(ctx context.Context, key string, del bool, value []byt
 				n.near.invalidate(key, rev)
 			}
 		}
-		return nil
+		return false, nil
 	}
 
 	if ctx.Err() != nil {
@@ -461,18 +506,17 @@ func (n *Namespace) write(ctx context.Context, key string, del bool, value []byt
 		if n.near != nil {
 			n.near.invalidate(key, 0)
 		}
-		return ctx.Err()
+		return false, ctx.Err()
 	}
-	fallback := n.spec.Write == WriteAround && canFallback(err)
-	if !fallback {
+	if n.spec.Write != WriteAround || !canFallback(err) {
 		// Our own copy may be stale if the write landed before the error.
 		if n.near != nil && cacheUnavailable(err) {
 			n.near.invalidate(key, 0)
 		}
-		return mapErr(err)
+		return false, mapErr(err)
 	}
 	if n.direct == nil {
-		return mapErr(err)
+		return false, mapErr(err)
 	}
 	if del {
 		rev, _, err = n.direct.Delete(ctx, key)
@@ -480,14 +524,14 @@ func (n *Namespace) write(ctx context.Context, key string, del bool, value []byt
 		rev, err = n.direct.Put(ctx, key, value)
 	}
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrBackendUnavailable, err)
+		return false, fmt.Errorf("%w: %w", ErrBackendUnavailable, err)
 	}
 	n.stats.FallbackWrites.Add(1)
 	n.writes.add(key, rev)
 	if n.near != nil {
 		n.near.invalidate(key, 0)
 	}
-	return nil
+	return true, nil
 }
 
 // Invalidate drops keys from the cache and from every near-cache, without

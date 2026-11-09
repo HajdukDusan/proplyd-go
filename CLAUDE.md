@@ -33,6 +33,25 @@ is tagged.
   NAMESPACE_NOT_FOUND triggers one re-register and retry; if it repeats,
   that counts as cache unavailable.
 
+- **Shared store reads** (`coalesce.go`): aside loads and fallback reads go
+  through `coalescer`. Every Lookup takes a ticket first. A read joins one in
+  flight if that read started after the lookup did (newer ticket), or if the
+  client has not served or written the key since it started: cache-path
+  reads, writes (even failed ones) and a replaced flight's completion call
+  `observe`, which marks the flight. This keeps read-your-writes and
+  monotonic reads.
+  - A plain singleflight would return values older than the caller had
+    already seen.
+  - The first version (ticket rule only) shared nothing under steady
+    traffic: every request arriving during a slow Prometheus load started its
+    own. The c12s bench caught it (625 timeouts at 50/s);
+    `TestStaggeredAsideMissesShareOneLoad` guards it.
+  - Only the leader of a shared aside load sends the Fill. The read runs
+  detached from the leader's cancellation (keeps its deadline, else
+  WriteTimeout), so a caller giving up never fails the others.
+- **Statistics**: Lookup/write record latency by path only on success;
+  `promexport` is a separate package so the core has no Prometheus
+  dependency.
 - **Write-behind**:
   - success: `near.invalidate(key, 0)`, and no `recentWrites` (there is no
     store revision yet);

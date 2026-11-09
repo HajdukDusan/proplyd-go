@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	proplyd "github.com/c12s/proplyd-go"
 	"github.com/c12s/proplyd-go/internal/testcluster"
+	"github.com/c12s/proplyd/pkg/backend"
 	"github.com/c12s/proplyd/pkg/server"
 	"github.com/c12s/proplyd/proplydtest"
 )
@@ -153,7 +156,10 @@ func TestCacheNeverStarted(t *testing.T) {
 		}
 		return nil
 	})
-	mustSet(t, wt, "k", "v2")
+	// wt is another client with its own breaker, which may still be open
+	// (its background registration failed while proplyd was down); until it
+	// closes, write-through writes are rejected, as they should be.
+	eventually(t, func() error { return wt.Set(context.Background(), "k", []byte("v2")) })
 	testcluster.WaitNearUsable(t, wt)
 }
 
@@ -174,6 +180,9 @@ func TestCacheCrashAndRestart(t *testing.T) {
 	if st := e.Client.State(); st != proplyd.BreakerOpen {
 		t.Fatalf("breaker %v, want open", st)
 	}
+	if b := e.Client.BreakerStats(); b.Opened == 0 || b.LastChange.IsZero() {
+		t.Fatalf("breaker stats after the crash: %+v", b)
+	}
 	if ns.Stats().NearUsable {
 		t.Fatal("near-cache must not be trusted without the invalidation stream")
 	}
@@ -188,8 +197,118 @@ func TestCacheCrashAndRestart(t *testing.T) {
 		}
 		return nil
 	})
+	if b := e.Client.BreakerStats(); b.Closed == 0 || b.Opened == 0 {
+		t.Fatalf("breaker stats after recovery: %+v", b)
+	}
 	testcluster.WaitNearUsable(t, ns)
 	expect(t, mustGet(t, ns, "k"), "down9")
+	st := ns.Stats()
+	if st.ReadLatency[proplyd.PathFallback].Count == 0 || st.WriteLatency[proplyd.WritePathFallback].Count == 0 {
+		t.Fatalf("fallback latency not recorded: %+v %+v", st.ReadLatency, st.WriteLatency)
+	}
+}
+
+// countingBackend counts reads and makes them slow, so that concurrent
+// misses overlap.
+type countingBackend struct {
+	backend.Backend
+	delay time.Duration
+	gets  atomic.Int32
+}
+
+func (b *countingBackend) Get(ctx context.Context, key string) (backend.Item, error) {
+	b.gets.Add(1)
+	time.Sleep(b.delay)
+	return b.Backend.Get(ctx, key)
+}
+
+// Many lookups missing a cache-aside key at once (a TTL expiry under load)
+// share one store read, and only that one fills the cache.
+func TestConcurrentAsideMissesShareOneLoad(t *testing.T) {
+	c := testcluster.New(t, testcluster.Options{})
+	e := c.Edge()
+	be := &countingBackend{Backend: c.Store, delay: 100 * time.Millisecond}
+	ns, err := e.Client.Namespace(ctxT(t), "aside", proplyd.NamespaceConfig{
+		Spec:      proplyd.Spec{Read: proplyd.CacheAside, KeyPrefix: "/aside/"},
+		Backend:   be,
+		NearCache: proplyd.NearCacheConfig{Disabled: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Store.Put(ctxT(t), "/aside/k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	const readers = 20
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range readers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			it, err := ns.Lookup(ctxT(t), "k")
+			if err != nil || string(it.Value) != "v" {
+				t.Errorf("lookup: %v %+v", err, it)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	st := ns.Stats()
+	if n := be.gets.Load(); n > 2 {
+		t.Fatalf("%d store reads for %d concurrent misses", n, readers)
+	}
+	if st.AsideLoads != readers || st.SharedLoads < readers-2 {
+		t.Fatalf("aside loads %d, shared %d", st.AsideLoads, st.SharedLoads)
+	}
+	if h := st.ReadLatency[proplyd.PathAside]; h.Count != readers || h.Sum < readers*be.delay {
+		t.Fatalf("aside latency: %+v", h)
+	}
+	// The fill reached the cache: the next miss in the near-cache is a hit.
+	eventually(t, func() error {
+		if it := mustGet(t, ns, "k"); it.Source != proplyd.SourceCache {
+			return fmt.Errorf("not filled: %v", it.Source)
+		}
+		return nil
+	})
+	if n := be.gets.Load(); n > 2 {
+		t.Fatalf("%d store reads after the fill", n)
+	}
+}
+
+// Lookups arriving one by one while a slow load is in flight (steady
+// traffic on an expired key) share it too.
+func TestStaggeredAsideMissesShareOneLoad(t *testing.T) {
+	c := testcluster.New(t, testcluster.Options{})
+	e := c.Edge()
+	be := &countingBackend{Backend: c.Store, delay: 200 * time.Millisecond}
+	ns, err := e.Client.Namespace(ctxT(t), "aside", proplyd.NamespaceConfig{
+		Spec:      proplyd.Spec{Read: proplyd.CacheAside, KeyPrefix: "/aside/"},
+		Backend:   be,
+		NearCache: proplyd.NearCacheConfig{Disabled: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Store.Put(ctxT(t), "/aside/k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := ns.Lookup(ctxT(t), "k"); err != nil {
+				t.Error(err)
+			}
+		}()
+		time.Sleep(10 * time.Millisecond)
+	}
+	wg.Wait()
+	if n := be.gets.Load(); n > 2 {
+		t.Fatalf("%d store reads for 10 lookups during one load", n)
+	}
 }
 
 // The scenario behind write-around's fallback: an edge cut off from the

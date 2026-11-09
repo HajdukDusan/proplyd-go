@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/c12s/proplyd/pkg/api"
@@ -127,6 +128,10 @@ type Client struct {
 	breaker *gobreaker.CircuitBreaker[struct{}]
 	log     *slog.Logger
 
+	// Breaker transitions into each state, and the time of the last one.
+	transitions [3]atomic.Int64 // indexed by gobreaker.State
+	lastChange  atomic.Int64    // unix nanos
+
 	mu         sync.Mutex
 	namespaces map[string]*Namespace
 	closed     bool
@@ -174,6 +179,8 @@ func New(cfg Config) (*Client, error) {
 		IsSuccessful: func(err error) bool { return !isCacheFailure(err) },
 		IsExcluded:   isCallerCancel,
 		OnStateChange: func(_ string, from, to gobreaker.State) {
+			c.transitions[to].Add(1)
+			c.lastChange.Store(time.Now().UnixNano())
 			c.log.Warn("proplyd circuit breaker", "from", from.String(), "to", to.String())
 		},
 	})
@@ -183,6 +190,41 @@ func New(cfg Config) (*Client, error) {
 
 // State returns the circuit breaker state.
 func (c *Client) State() BreakerState { return c.breaker.State() }
+
+// BreakerStats describes the circuit breaker's history.
+type BreakerStats struct {
+	State BreakerState
+	// Transitions into each state: Opened counts the times the cache was
+	// declared unavailable, Closed the times it was trusted again.
+	Opened, HalfOpened, Closed int64
+	// LastChange is the time of the last transition (zero if none).
+	LastChange time.Time
+}
+
+// BreakerStats returns the circuit breaker's state and transitions.
+func (c *Client) BreakerStats() BreakerStats {
+	st := BreakerStats{
+		State:      c.breaker.State(),
+		Opened:     c.transitions[gobreaker.StateOpen].Load(),
+		HalfOpened: c.transitions[gobreaker.StateHalfOpen].Load(),
+		Closed:     c.transitions[gobreaker.StateClosed].Load(),
+	}
+	if ns := c.lastChange.Load(); ns != 0 {
+		st.LastChange = time.Unix(0, ns)
+	}
+	return st
+}
+
+// Namespaces returns the client's open namespaces.
+func (c *Client) Namespaces() []*Namespace {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nss := make([]*Namespace, 0, len(c.namespaces))
+	for _, ns := range c.namespaces {
+		nss = append(nss, ns)
+	}
+	return nss
+}
 
 // Close closes every namespace and the connection.
 func (c *Client) Close() error {

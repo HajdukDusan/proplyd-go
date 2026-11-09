@@ -27,6 +27,9 @@ app ─▶ near-cache (in process) ─▶ proplyd (gRPC → Redis) ─▶ etcd
 - **Read-your-writes.** This holds even across fallbacks and restarts: the
   client remembers the revisions of its recent writes and never serves
   anything older.
+- **Shared store reads.** Concurrent cache-aside loads and fallback reads of
+  a key share one read of the store, so a TTL expiry under load costs one
+  query, not one per caller.
 
 ## Usage
 
@@ -109,9 +112,35 @@ transparently.
 
 Errors: `ErrCacheUnavailable`, `ErrBackendUnavailable`, `ErrBackpressure`,
 `ErrNamespaceConflict`, `ErrPrefixNotAllowed`, `ErrInvalidArgument`,
-`ErrClosed`, plus the caller's context errors. `ns.Stats()` reports near and
-cache hits, loads, fallbacks, invalidations and resets; `cli.State()`
-reports the breaker state.
+`ErrClosed`, plus the caller's context errors.
+
+## Statistics
+
+`ns.Stats()` reports near and cache hits, loads, fallbacks, shared loads,
+invalidations and resets, and latency histograms of successful reads by
+path (`near`, `cache`, `load` (a miss proplyd loaded), `aside` (a miss this
+client loaded), `fallback`) and of writes (`cache`, `fallback`).
+`cli.BreakerStats()` reports the breaker state, how often it opened,
+half-opened and closed, and when it last changed.
+
+The `promexport` subpackage exposes all of it to Prometheus (only clients
+that import it depend on the Prometheus library):
+
+```go
+reg := prometheus.NewRegistry()
+reg.MustRegister(promexport.NewCollector(cli)) // every namespace of cli
+http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+```
+
+Metrics: `proplyd_client_{near_hits,near_misses,cache_hits,cache_loads,
+aside_loads,shared_loads,writes,fallback_reads,fallback_writes,
+invalidations,resets,subscriptions}_total{namespace}`,
+`proplyd_client_read_duration_seconds{namespace,path}`,
+`proplyd_client_write_duration_seconds{namespace,path}`,
+`proplyd_client_near_entries`, `proplyd_client_near_usable`,
+`proplyd_client_breaker_state` (0 closed, 1 half-open, 2 open),
+`proplyd_client_breaker_transitions_total{to}` and
+`proplyd_client_breaker_last_change_timestamp_seconds`.
 
 ## Tests
 
